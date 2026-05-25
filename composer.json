@@ -1,0 +1,41 @@
+{
+  "name": "rublex/laravel-wallet-sweeper",
+  "description": "A laravel rublex package for sweep wallets",
+  "keywords": [
+    "rublex",
+    "wallet",
+    "aggregator",
+    "sweeper"
+  ],
+  "license": "MIT",
+  "minimum-stability": "stable",
+  "prefer-stable": true,
+  "autoload": {
+    "files": [
+      "utils/helpers/wallet_aggregator.php"
+    ],
+    "psr-4": {
+      "Rublex\\Wallet\\Aggregator\\": "src/"
+    }
+  },
+  "authors": [
+    {
+      "name": "RublexTeam",
+      "email": "hi@rublex.io"
+    }
+  ],
+  "require": {
+    "guzzlehttp/guzzle": "^7.0.1",
+    "ext-bcmath": "*"
+  },
+  "extra": {
+    "laravel": {
+      "providers": [
+        "Rublex\\Wallet\\Aggregator\\WalletAggregatorServiceProvider"
+      ],
+      "aliases": {
+        "WalletSweeper": "Rublex\\Wallet\\Aggregator\\Facades\\WalletSweeper"
+      }
+    }
+  }
+}
