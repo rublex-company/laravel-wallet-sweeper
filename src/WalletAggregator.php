@@ -29,6 +29,30 @@ class WalletAggregator
 
     private const DECIMALS = 18;
 
+    /**
+     * Confirmations to wait for after a fee-wallet top-up before retrying
+     * the main transfer. One block is enough for the chain service to see
+     * the new pay-in balance — without it, the retry races the top-up's
+     * mining and the chain still reports `Insufficient fee (gas)!` so a
+     * downstream cron retry burns a second top-up fee unnecessarily.
+     */
+    private const TOPUP_CONFIRMATIONS = 1;
+
+    /**
+     * How long to wait for the top-up to confirm before giving up and
+     * letting the retry race. Generous enough for the slowest EVM-class
+     * chain we run on (~3s per block × ~10 blocks of headroom). On
+     * timeout we proceed anyway; the job's own retry chain absorbs any
+     * remaining race.
+     */
+    private const TOPUP_CONFIRMATION_TIMEOUT_SECONDS = 30;
+
+    /**
+     * Seconds between confirmation polls. Short enough to retry quickly
+     * once the block lands, long enough to avoid hammering the RPC node.
+     */
+    private const TOPUP_CONFIRMATION_POLL_SECONDS = 2;
+
     public function __construct(protected TransactionService $service)
     {
         //
@@ -151,6 +175,14 @@ class WalletAggregator
                 if (!$this->isSuccessful($feeTx)) {
                     throw new Exception('Fee wallet gas top-up failed: ' . json_encode($feeTx));
                 }
+
+                // The top-up has a hash but the chain service queries node
+                // balances directly — until the top-up tx is mined, the
+                // chain still reports the pre-top-up balance and the retry
+                // would race the confirmation and fail with another
+                // `Insufficient fee (gas)!`. Wait for the top-up to land so
+                // a single retry is enough and no second top-up burns gas.
+                $this->waitForConfirmation($network, (string) $feeTx['hash']);
             }
 
             // Step 3: retry once with the now-funded gas. The top-up
@@ -168,6 +200,32 @@ class WalletAggregator
     private function isSuccessful(mixed $tx): bool
     {
         return is_array($tx) && array_key_exists('hash', $tx);
+    }
+
+    /**
+     * Poll the chain service's confirmation endpoint until the given tx
+     * has at least TOPUP_CONFIRMATIONS blocks behind it, or the timeout
+     * elapses. Returns once the chain reports confirmed (or on timeout —
+     * the caller's retry chain absorbs any remaining race).
+     */
+    private function waitForConfirmation(string $network, string $hash): void
+    {
+        $deadline = time() + self::TOPUP_CONFIRMATION_TIMEOUT_SECONDS;
+
+        while (time() < $deadline) {
+            try {
+                $response = $this->service->confirmation($network, $hash, self::TOPUP_CONFIRMATIONS);
+                if (($response['confirmed'] ?? false) === true) {
+                    return;
+                }
+            } catch (Exception) {
+                // Transient lookup failure (RPC blip, network blink) —
+                // fall through to the sleep + next iteration. Don't bail
+                // out, the deadline already caps the total wait.
+            }
+
+            sleep(self::TOPUP_CONFIRMATION_POLL_SECONDS);
+        }
     }
 
     /**

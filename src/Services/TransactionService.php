@@ -54,6 +54,22 @@ class TransactionService extends PendingRequest
         return $preview ? data_get($response, 'gas') : $response;
     }
 
+    /**
+     * Ask the chain service whether a tx has at least $threshold confirmed
+     * blocks behind it. Returns the parsed response — typically shaped
+     * `{confirmed: bool, threshold: int, passed_blocks: int}`.
+     *
+     * @throws ConnectionException
+     */
+    public function confirmation(string $network, string $hash, int $threshold = 1): array
+    {
+        return $this->post('/check-tx-confirmation', [
+            'chain'     => $network,
+            'hash'      => $hash,
+            'threshold' => $threshold,
+        ])->json();
+    }
+
     function convertScientificToDecimal(string $sci, int $precision = 20): string
     {
         // Check if the number is in scientific notation
