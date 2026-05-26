@@ -15,8 +15,19 @@ use Rublex\Wallet\Aggregator\Services\TransactionService;
 
 class WalletAggregator
 {
-
     final public const VERSION = '1.0.0';
+
+    /**
+     * Headroom applied on top of the reported gas figure (the chain's
+     * `required_fee` on token sweeps, the preview's gas on native sweeps).
+     * Absorbs the small gas-price drift between the figure being reported
+     * and the broadcast that consumes it, so a single top-up + single retry
+     * is always enough — we never need a second top-up trip that would burn
+     * extra native fees out of the customer's pocket.
+     */
+    private const GAS_BUFFER = '1.2';
+
+    private const DECIMALS = 18;
 
     public function __construct(protected TransactionService $service)
     {
@@ -24,152 +35,274 @@ class WalletAggregator
     }
 
     /**
+     * Sweep funds from a pay-in wallet to the aggregator address.
+     *
+     * Required params:
+     *  - aggregator_address: destination
+     *  - network: chain slug (bsc, eth, trx, ...)
+     *  - pay_in_wallet: ['address' => ..., 'private_key' => ...]
+     *
+     * Token sweeps (token_contract set) additionally require:
+     *  - fee_wallet: ['address' => ..., 'private_key' => ...] — funds the
+     *    pay-in wallet's gas top-up just before the transfer.
+     *
+     * Optional params:
+     *  - amount: explicit withdrawal amount (decimal string). When omitted,
+     *    sweeps the maximum possible (token: full token balance; native:
+     *    balance minus gas). When provided but greater than the maximum
+     *    possible, it's clamped down so the call never fails for "too high"
+     *    on the caller's side.
+     *  - token_contract: null means a native-coin sweep (BNB/ETH/TRX/...).
+     *  - callback: URL the result is POSTed to.
+     *
      * @throws IsNullException
      * @throws Exception
      */
     public function run(array $params): array
     {
-        // null token_contract means a native-coin sweep (BNB/ETH/TRX/...).
         $tokenContract = $params['token_contract'] ?? null;
 
         $aggregatorAddress = $params['aggregator_address'] ?? throw new IsNullException('Aggregator ("aggregator_address") address is null');
 
         $network = $params['network'] ?? throw new IsNullException('Network ("network") is null');
 
-        $pay_in_wallet_private_key = $params['pay_in_wallet']['private_key'] ?? throw new IsNullException('Payment wallet private key (["pay_in_wallet"]["private_key"]) is null');
-        $pay_in_wallet_address = $params['pay_in_wallet']['address'] ?? throw new IsNullException('Payment wallet address (["pay_in_wallet"]["address"]) is null');
-        $payInWallet = new Wallet($pay_in_wallet_private_key, $pay_in_wallet_address, $network);
+        $payInWalletPrivateKey = $params['pay_in_wallet']['private_key'] ?? throw new IsNullException('Payment wallet private key (["pay_in_wallet"]["private_key"]) is null');
+        $payInWalletAddress = $params['pay_in_wallet']['address'] ?? throw new IsNullException('Payment wallet address (["pay_in_wallet"]["address"]) is null');
+        $payInWallet = new Wallet($payInWalletPrivateKey, $payInWalletAddress, $network);
 
-        $buffering = '1.2';
+        $requestedAmount = $this->normalizeRequestedAmount($params['amount'] ?? null);
 
         if ($tokenContract === null) {
-            return $this->sweepNative($payInWallet, $aggregatorAddress, $network, $buffering, $params);
+            return $this->sweepNative($payInWallet, $aggregatorAddress, $network, $requestedAmount, $params);
         }
 
-        $fee_wallet_wallet_private_key = $params['fee_wallet']['private_key'] ?? throw new IsNullException('Fee wallet private key (["fee_wallet"]["private_key"]) is null');
-        $fee_wallet_wallet_address = $params['fee_wallet']['address'] ?? throw new IsNullException('Fee wallet address (["fee_wallet"]["address"]) is null');
-        $feeWallet = new Wallet($fee_wallet_wallet_private_key, $fee_wallet_wallet_address, $network);
+        $feeWalletPrivateKey = $params['fee_wallet']['private_key'] ?? throw new IsNullException('Fee wallet private key (["fee_wallet"]["private_key"]) is null');
+        $feeWalletAddress = $params['fee_wallet']['address'] ?? throw new IsNullException('Fee wallet address (["fee_wallet"]["address"]) is null');
+        $feeWallet = new Wallet($feeWalletPrivateKey, $feeWalletAddress, $network);
 
+        return $this->sweepToken($payInWallet, $feeWallet, $tokenContract, $aggregatorAddress, $network, $requestedAmount, $params);
+    }
+
+    /**
+     * Token sweep: pay-in wallet sends ERC20-style tokens to the aggregator,
+     * and the fee wallet covers the native-coin gas the pay-in wallet needs.
+     *
+     * Fee discovery is driven by the network response, not by a separate
+     * preview round-trip. We submit the real transfer first; when the
+     * pay-in wallet already holds enough gas (leftover from a previous
+     * sweep, manual top-up, etc.) the call succeeds in one shot. Otherwise
+     * the chain returns `Insufficient fee (gas)!` with the exact
+     * `required_fee` figure, which we use to top up the precise gap from
+     * the fee wallet (plus a small buffer) before retrying once. Sizing
+     * the top-up off the chain's own number guarantees no second top-up
+     * trip is ever needed and no customer tokens are wasted.
+     *
+     * @throws IsNullException
+     * @throws Exception
+     */
+    private function sweepToken(
+        Wallet $payInWallet,
+        Wallet $feeWallet,
+        string $tokenContract,
+        string $aggregatorAddress,
+        string $network,
+        ?string $requestedAmount,
+        array $params
+    ): array {
         $tokenBalance = $this->service->balance($payInWallet, $tokenContract);
-
-        if ($tokenBalance <= 0) throw new IsNullException('No balance in payment wallet');
-
-        $bnbBalance = $this->service->balance($payInWallet);
-
-        $transfer = new Transfer($payInWallet, $tokenBalance, $aggregatorAddress, $tokenContract);
-        $gas = $this->service->transfer($transfer, true);
-
-        $gasWithBuffer = bcmul($gas, $buffering, 18);
-
-        if (bccomp($bnbBalance, $gasWithBuffer, 18) < 0) {
-
-            $missingGas = bcsub($gasWithBuffer, $bnbBalance, 18);
-
-            $transferGas = new Transfer($feeWallet, $missingGas, $payInWallet->getAddress());
-            $feeTx = $this->service->transfer($transferGas);
+        if (bccomp((string) $tokenBalance, '0', self::DECIMALS) <= 0) {
+            throw new IsNullException('No balance in payment wallet');
         }
 
+        $amount = $this->clampToBalance($requestedAmount, (string) $tokenBalance);
+        $transfer = new Transfer($payInWallet, $amount, $aggregatorAddress, $tokenContract);
+
+        // Step 1: send the real transfer. When gas is already sufficient
+        // this single call is the whole flow.
         $tx = $this->service->transfer($transfer);
+        $feeTx = null;
 
-        $reason = $tx['reason'] ?? null;
+        if (!$this->isSuccessful($tx)) {
+            // Step 2: read the exact gas figure the chain reported in its
+            // "Insufficient fee (gas)!" response. This is the authoritative
+            // number — the same one the chain's own preview would return.
+            $requiredFee = $this->extractRequiredFee($tx);
 
-        if ($reason && str_contains($reason, 'insufficient funds for gas')) {
-            preg_match('/have (\d+) want (\d+)/', $reason, $matches);
+            if ($requiredFee === null) {
+                // Not a gas issue, or the response didn't carry a
+                // parseable fee. Let the caller see the raw response.
+                return $this->finalize($tx, $feeTx, $payInWallet, $aggregatorAddress, $network, $tokenContract, $amount, $params);
+            }
 
-            if (count($matches) === 3) {
+            $nativeBalance = (string) $this->service->balance($payInWallet);
+            $missingGas = bcsub($requiredFee, $nativeBalance, self::DECIMALS);
 
-                $have = bcdiv($matches[1], bcpow('10', '18'), 18);
-                $want = bcdiv($matches[2], bcpow('10', '18'), 18);
+            // Defensive: if the wallet now reports enough native (cached
+            // balance from another in-flight sweep, etc.), skip top-up and
+            // go straight to the retry.
+            if (bccomp($missingGas, '0', self::DECIMALS) > 0) {
+                $topupAmount = bcmul($missingGas, self::GAS_BUFFER, self::DECIMALS);
+                $topup = new Transfer($feeWallet, $topupAmount, $payInWallet->getAddress());
+                $feeTx = $this->service->transfer($topup);
 
-                $needed = bcmul(bcsub($want, $have, 18), $buffering, 18);
+                // If the fee wallet itself couldn't fund the gas, retrying
+                // the main transfer would just produce the same error —
+                // surface it so the caller can flag fee wallet insufficient.
+                if (!$this->isSuccessful($feeTx)) {
+                    throw new Exception('Fee wallet gas top-up failed: ' . json_encode($feeTx));
+                }
+            }
 
-                // Re-send gas fee
-                $gasTopUp = new Transfer($feeWallet, $needed, $payInWallet->getAddress());
-                $this->service->transfer($gasTopUp);
+            // Step 3: retry once with the now-funded gas. The top-up
+            // covered the chain's exact requirement, so one retry is enough.
+            $tx = $this->service->transfer($transfer);
+        }
 
-                // Wait for confirmation (you can implement a poll/sleep here if necessary)
-                sleep(120); // optionally wait before retrying
+        return $this->finalize($tx, $feeTx, $payInWallet, $aggregatorAddress, $network, $tokenContract, $amount, $params);
+    }
 
-                // Retry transfer gas
-                $tx = $this->service->transfer($transfer);
+    /**
+     * Whether the chain service's transfer response represents a confirmed
+     * broadcast (has a tx hash).
+     */
+    private function isSuccessful(mixed $tx): bool
+    {
+        return is_array($tx) && array_key_exists('hash', $tx);
+    }
 
-                if ($tx['reason'] ?? false)
-                    throw new Exception("Transaction reverted: " . json_encode($tx));
+    /**
+     * Read the total native-coin gas required for the transfer out of a
+     * failed response. The chain service surfaces this as `required_fee`
+     * alongside the "Insufficient fee (gas)!" message; standard
+     * go-ethereum revert text (`have X want Y`, wei) is accepted as a
+     * fallback. Returns the total required figure as a decimal string in
+     * native units, or null when nothing parseable is present.
+     */
+    private function extractRequiredFee(mixed $tx): ?string
+    {
+        if (!is_array($tx)) {
+            return null;
+        }
+
+        if (isset($tx['required_fee']) && is_numeric($tx['required_fee'])) {
+            $val = (string) $tx['required_fee'];
+            if (bccomp($val, '0', self::DECIMALS) > 0) {
+                return $val;
             }
         }
 
-        $transactionStatus = array_key_exists('hash', $tx);
+        $reason = $tx['reason'] ?? $tx['message'] ?? null;
+        if (is_string($reason) && preg_match('/have (\d+) want (\d+)/', $reason, $matches)) {
+            $weiPerNative = bcpow('10', '18');
+            return bcdiv($matches[2], $weiPerNative, self::DECIMALS);
+        }
+
+        return null;
+    }
+
+    /**
+     * Native sweep: the pay-in wallet pays its own gas in the same currency
+     * it's sending, so there is no separate fee-wallet top-up. The effective
+     * amount is whichever is smaller of the requested amount and
+     * `balance - gas` so the call never tries to overspend the wallet.
+     *
+     * @throws IsNullException
+     * @throws Exception
+     */
+    private function sweepNative(
+        Wallet $payInWallet,
+        string $aggregatorAddress,
+        string $network,
+        ?string $requestedAmount,
+        array $params
+    ): array {
+        $nativeBalance = (string) $this->service->balance($payInWallet);
+        if (bccomp($nativeBalance, '0', self::DECIMALS) <= 0) {
+            throw new IsNullException('No balance in payment wallet');
+        }
+
+        // Gas for a native send is essentially independent of amount on EVM
+        // and TRX, so we preview against the full balance to get a stable
+        // figure and then derive the effective amount from it.
+        $previewTransfer = new Transfer($payInWallet, $nativeBalance, $aggregatorAddress);
+        $gas = (string) $this->service->transfer($previewTransfer, true);
+        $gasWithBuffer = bcmul($gas, self::GAS_BUFFER, self::DECIMALS);
+
+        $maxSendable = bcsub($nativeBalance, $gasWithBuffer, self::DECIMALS);
+        if (bccomp($maxSendable, '0', self::DECIMALS) <= 0) {
+            throw new Exception('Insufficient native balance to cover gas');
+        }
+
+        $amount = $this->clampToBalance($requestedAmount, $maxSendable);
+
+        $transfer = new Transfer($payInWallet, $amount, $aggregatorAddress);
+        $tx = $this->service->transfer($transfer);
+
+        if ($tx['reason'] ?? false) {
+            throw new Exception("Transaction reverted: " . json_encode($tx));
+        }
+
+        return $this->finalize($tx, null, $payInWallet, $aggregatorAddress, $network, null, $amount, $params);
+    }
+
+    /**
+     * Normalize the caller-supplied amount to a decimal string, or null when
+     * the caller didn't request a specific amount (= sweep the maximum
+     * sendable).
+     */
+    private function normalizeRequestedAmount(mixed $amount): ?string
+    {
+        if ($amount === null || $amount === '') {
+            return null;
+        }
+        if (!is_numeric($amount)) {
+            return null;
+        }
+        $amount = (string) $amount;
+        if (bccomp($amount, '0', self::DECIMALS) <= 0) {
+            return null;
+        }
+        return $amount;
+    }
+
+    /**
+     * Clamp the requested amount to whatever the wallet can actually send.
+     * Returns the requested amount when it fits, the max sendable when it
+     * doesn't (or when the caller didn't request a specific amount).
+     */
+    private function clampToBalance(?string $requested, string $max): string
+    {
+        if ($requested === null) {
+            return $max;
+        }
+        return bccomp($requested, $max, self::DECIMALS) > 0 ? $max : $requested;
+    }
+
+    /**
+     * Build the final response payload (and post the callback when set).
+     *
+     * @throws Exception when the callback HTTP call fails.
+     */
+    private function finalize(
+        mixed $tx,
+        ?array $feeTx,
+        Wallet $payInWallet,
+        string $aggregatorAddress,
+        string $network,
+        ?string $tokenContract,
+        string $amount,
+        array $params
+    ): array {
+        $transactionStatus = $this->isSuccessful($tx);
 
         if (array_key_exists('callback', $params)) {
-
             $callbackResponse = Http::post($params['callback'], [
                 'result' => $transactionStatus,
                 'network' => $network,
                 'contract' => $tokenContract,
                 'input' => $payInWallet->getAddress(),
                 'output' => $aggregatorAddress,
-                'amount' => $tokenBalance,
-                'message' => $transactionStatus ? 'Transaction completed' : 'Transaction reverted',
-            ]);
-
-            if ($callbackResponse->failed())
-                throw new Exception("Callback Failed: " . json_encode($callbackResponse->body()));
-        }
-
-        return [
-            'status' => $transactionStatus,
-            'message' => $transactionStatus ? 'Transaction completed' : 'Transaction reverted',
-            'transaction' => $tx ?? null,
-            'fee_transaction' => $feeTx ?? null
-        ];
-    }
-
-    /**
-     * Sweep a native coin (no ERC20-style contract). The pay-in wallet pays its
-     * own gas, so a fee_wallet top-up isn't part of the flow — we just transfer
-     * `balance - gasWithBuffer` to the aggregator.
-     *
-     * @throws IsNullException
-     * @throws Exception
-     */
-    private function sweepNative(Wallet $payInWallet, string $aggregatorAddress, string $network, string $buffering, array $params): array
-    {
-        $nativeBalance = $this->service->balance($payInWallet);
-
-        if (bccomp((string) $nativeBalance, '0', 18) <= 0) {
-            throw new IsNullException('No balance in payment wallet');
-        }
-
-        // Estimate gas using a preview of "transfer the full balance". On EVM
-        // and TRX the gas for a native send doesn't change with the amount, so
-        // sizing the preview at full balance is safe.
-        $previewTransfer = new Transfer($payInWallet, (string) $nativeBalance, $aggregatorAddress);
-        $gas = $this->service->transfer($previewTransfer, true);
-
-        $gasWithBuffer = bcmul((string) $gas, $buffering, 18);
-
-        $amount = bcsub((string) $nativeBalance, $gasWithBuffer, 18);
-        if (bccomp($amount, '0', 18) <= 0) {
-            throw new Exception('Insufficient native balance to cover gas');
-        }
-
-        $transfer = new Transfer($payInWallet, $amount, $aggregatorAddress);
-        $tx = $this->service->transfer($transfer);
-
-        if (($tx['reason'] ?? false)) {
-            throw new Exception("Transaction reverted: " . json_encode($tx));
-        }
-
-        $transactionStatus = array_key_exists('hash', $tx);
-
-        if (array_key_exists('callback', $params)) {
-            $callbackResponse = Http::post($params['callback'], [
-                'result'  => $transactionStatus,
-                'network' => $network,
-                'contract' => null,
-                'input'   => $payInWallet->getAddress(),
-                'output'  => $aggregatorAddress,
-                'amount'  => $amount,
+                'amount' => $amount,
                 'message' => $transactionStatus ? 'Transaction completed' : 'Transaction reverted',
             ]);
 
@@ -179,10 +312,10 @@ class WalletAggregator
         }
 
         return [
-            'status'          => $transactionStatus,
-            'message'         => $transactionStatus ? 'Transaction completed' : 'Transaction reverted',
-            'transaction'     => $tx ?? null,
-            'fee_transaction' => null,
+            'status' => $transactionStatus,
+            'message' => $transactionStatus ? 'Transaction completed' : 'Transaction reverted',
+            'transaction' => $tx ?? null,
+            'fee_transaction' => $feeTx,
         ];
     }
 }
