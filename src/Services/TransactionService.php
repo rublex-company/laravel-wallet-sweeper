@@ -70,6 +70,43 @@ class TransactionService extends PendingRequest
         ])->json();
     }
 
+    /**
+     * Atomic sweep: hand the whole flow (top-up, then send) to the chain
+     * service. For tokens the service tops up the pay-in wallet from the
+     * fee wallet by the exact gap, then sends the token to `output`; the
+     * top-up tx is awaited before the send so there's no confirmation
+     * race in client code. For native sweeps the pay-in wallet pays its
+     * own gas — no fee wallet leg.
+     *
+     * `$amount` is the explicit withdrawal amount; when null the service
+     * sweeps the maximum possible (full token balance for tokens, balance
+     * minus gas for native). When provided but larger than the max the
+     * service clamps it down so this call never errors for "too high".
+     *
+     * Returns the raw response, typically shaped:
+     *   {hash, amount, fee, fee_hash}     // success
+     *   {message, required_fee?}          // failure
+     *
+     * @throws ConnectionException
+     */
+    public function settle(
+        string $network,
+        string $payInPrivateKey,
+        string $output,
+        ?string $tokenContract = null,
+        ?string $feePrivateKey = null,
+        ?string $amount = null,
+    ): array {
+        return $this->post('/settle', [
+            'chain'           => $network,
+            'private_key'     => $payInPrivateKey,
+            'fee_private_key' => $feePrivateKey,
+            'output'          => $output,
+            'token_contract'  => $tokenContract,
+            'amount'          => $amount,
+        ])->json();
+    }
+
     function convertScientificToDecimal(string $sci, int $precision = 20): string
     {
         // Check if the number is in scientific notation
