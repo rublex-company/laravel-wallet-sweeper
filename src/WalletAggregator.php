@@ -36,15 +36,16 @@ class WalletAggregator
      *  - aggregator_address: destination
      *  - network: chain slug (bsc, eth, trx, ...)
      *  - pay_in_wallet: ['address' => ..., 'private_key' => ...]
-     *
-     * Token sweeps (token_contract set) additionally require:
-     *  - fee_wallet: ['address' => ..., 'private_key' => ...]
+     *  - fee_wallet: ['address' => ..., 'private_key' => ...] — funds gas.
+     *    Required for token sweeps; for native sweeps it's used when present
+     *    (so the merchant gets the full amount) but falls back gracefully
+     *    when absent or when it's the pay-in wallet itself.
      *
      * Optional params:
      *  - amount: explicit withdrawal amount as a decimal string. When
      *    omitted the chain sweeps the maximum possible (token: full token
-     *    balance; native: balance minus gas). When provided but larger
-     *    than the max, the chain clamps it down.
+     *    balance; native: full balance, gas funded from the fee wallet).
+     *    When provided but larger than the max, the chain clamps it down.
      *  - token_contract: null for a native-coin sweep.
      *  - callback: URL the result is POSTed to.
      *
@@ -61,12 +62,16 @@ class WalletAggregator
         $payInPrivateKey = $params['pay_in_wallet']['private_key'] ?? throw new IsNullException('Payment wallet private key (["pay_in_wallet"]["private_key"]) is null');
         $payInAddress = $params['pay_in_wallet']['address'] ?? throw new IsNullException('Payment wallet address (["pay_in_wallet"]["address"]) is null');
 
-        // fee_wallet is required for token sweeps (the chain tops up gas
-        // from it) and unused for native sweeps (the pay-in wallet pays
-        // its own gas in the same currency).
-        $feePrivateKey = null;
-        if ($tokenContract !== null) {
-            $feePrivateKey = $params['fee_wallet']['private_key'] ?? throw new IsNullException('Fee wallet private key (["fee_wallet"]["private_key"]) is null');
+        // fee_wallet funds the gas. Token sweeps require it (the chain tops
+        // up the pay-in wallet's native gas from it). Native sweeps use it
+        // too when present — the chain tops the pay-in wallet up so the FULL
+        // amount reaches the merchant instead of (amount - gas) — but it's
+        // optional there: with no distinct fee wallet (or when the fee wallet
+        // is itself the pay-in, e.g. a fee-wallet withdrawal) the chain falls
+        // back to sending (balance - gas).
+        $feePrivateKey = $params['fee_wallet']['private_key'] ?? null;
+        if ($tokenContract !== null && $feePrivateKey === null) {
+            throw new IsNullException('Fee wallet private key (["fee_wallet"]["private_key"]) is null');
         }
 
         $amount = $this->normalizeAmount($params['amount'] ?? null);
